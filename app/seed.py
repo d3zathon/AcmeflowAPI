@@ -18,12 +18,22 @@ from .security import get_password_hash
 
 
 def clear_all(db):
-    # Delete in FK-safe order: payments -> expenses -> projects -> users -> settings
-    db.query(models.Payment).delete()
-    db.query(models.Expense).delete()
-    db.query(models.Project).delete()
-    db.query(models.User).delete()
-    db.query(models.CompanySetting).delete()
+    """Clear lab data and reset PostgreSQL identities to deterministic IDs.
+
+    ``DELETE`` removes rows but does not reset PostgreSQL sequences. Because the
+    Docker Compose service runs ``seed --reset`` on every API start, repeated
+    container restarts previously changed Alice from user 5 to 12, 19, ... while
+    ``apiat/roles.yaml`` continued to reference the deterministic IDs. That made
+    APIAT probe nonexistent resources and report 404 rather than exercising the
+    intended vulnerabilities.
+
+    TRUNCATE ... RESTART IDENTITY restores the sequences atomically. CASCADE is
+    scoped to this isolated training database and guarantees FK-safe cleanup.
+    """
+    db.execute(
+        "TRUNCATE TABLE payments, expenses, projects, users, company_settings "
+        "RESTART IDENTITY CASCADE"
+    )
     db.commit()
 
 
