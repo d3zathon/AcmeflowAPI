@@ -1,0 +1,371 @@
+# =============================================================================
+# apiat/roles.yaml
+#
+# APIAT (API Attack-Path Tester) configuration for the AcmeFlow API lab.
+#
+# This file is generated to match app/seed.py exactly (fixed, deterministic
+# IDs/credentials). If you change the seed data, update this file to match.
+#
+# Local, deliberately vulnerable lab target -- do not point APIAT at any
+# non-local deployment of this API.
+# =============================================================================
+
+target:
+  name: AcmeFlow API
+  base_url: http://localhost:8000
+  openapi_url: http://localhost:8000/openapi.json
+  docs_url: http://localhost:8000/docs
+  redoc_url: http://localhost:8000/redoc
+  health_url: http://localhost:8000/health
+
+auth:
+  type: oauth2_password
+  token_url: /api/v1/auth/login
+  request_encoding: form            # username/password sent as form fields
+  response_token_field: access_token
+  header: Authorization
+  scheme: Bearer
+  identity_markers:
+    jwt_claim_user_id: sub          # string-encoded integer user id
+    jwt_claim_role: role            # one of Employee | Manager | Finance | Admin
+    jwt_claim_username: username
+
+# -----------------------------------------------------------------------------
+# Roles and test credentials (all users share the deterministic seed above)
+# -----------------------------------------------------------------------------
+roles:
+  employee:
+    description: Standard staff member. Owns and manages only their own expenses.
+    users:
+      - username: alice
+        password: "Alice#2024"
+        user_id: 5
+        department: Engineering
+        manager_id: 2   # bob
+      - username: carol
+        password: "Carol#2024"
+        user_id: 6
+        department: Engineering
+        manager_id: 2   # bob
+      - username: frank
+        password: "Frank#2024"
+        user_id: 7
+        department: Sales
+        manager_id: 3   # erin
+
+  manager:
+    description: Approves/rejects expenses for direct reports; owns a project.
+    users:
+      - username: bob
+        password: "Bob#2024"
+        user_id: 2
+        department: Engineering
+        direct_reports: [5, 6]   # alice, carol
+      - username: erin
+        password: "Erin#2024"
+        user_id: 3
+        department: Sales
+        direct_reports: [7]      # frank
+
+  finance:
+    description: Views all expenses and processes payments; not an admin.
+    users:
+      - username: david
+        password: "David#2024"
+        user_id: 4
+        department: Finance
+
+  admin:
+    description: Full administrative access; manages users, roles, and settings.
+    users:
+      - username: admin
+        password: "Admin#2024"
+        user_id: 1
+        department: Operations
+
+# -----------------------------------------------------------------------------
+# Resource ownership map (fixed IDs produced by app/seed.py --reset)
+# -----------------------------------------------------------------------------
+resource_ownership:
+  users:
+    - {id: 1, username: admin, role: Admin}
+    - {id: 2, username: bob,   role: Manager}
+    - {id: 3, username: erin,  role: Manager}
+    - {id: 4, username: david, role: Finance}
+    - {id: 5, username: alice, role: Employee, manager_id: 2}
+    - {id: 6, username: carol, role: Employee, manager_id: 2}
+    - {id: 7, username: frank, role: Employee, manager_id: 3}
+
+  projects:
+    - {id: 1, code: P-ENG-001,   department: Engineering, manager_id: 2}
+    - {id: 2, code: P-SALES-001, department: Sales,       manager_id: 3}
+
+  expenses:
+    - {id: 1, owner_user_id: 5, status: DRAFT}
+    - {id: 2, owner_user_id: 5, status: SUBMITTED}
+    - {id: 3, owner_user_id: 5, status: PAID}
+    - {id: 4, owner_user_id: 6, status: SUBMITTED}
+    - {id: 5, owner_user_id: 7, status: SUBMITTED}
+    - {id: 6, owner_user_id: 7, status: APPROVED}
+
+  payments:
+    - {id: 1, expense_id: 3, status: COMPLETED}
+    - {id: 2, expense_id: 6, status: PENDING}
+
+  company_settings:
+    - {key: company_name, admin_only: true}
+    - {key: approval_threshold_usd, admin_only: true}
+    - {key: fiscal_year_start, admin_only: true}
+    - {key: payment_processor, admin_only: true}
+
+# -----------------------------------------------------------------------------
+# Expense workflow state machine
+# -----------------------------------------------------------------------------
+workflows:
+  expense_lifecycle:
+    states: [DRAFT, SUBMITTED, APPROVED, REJECTED, PAID]
+    transitions:
+      - from: DRAFT
+        to: SUBMITTED
+        endpoint: "POST /api/v1/expenses/{id}/submit"
+        allowed_roles: [owner]
+        control: secure
+
+      - from: SUBMITTED
+        to: APPROVED
+        endpoint: "POST /api/v1/expenses/{id}/approve"
+        allowed_roles: [manager_of_owner, admin]
+        control: secure
+        notes: Enforces both role AND that the manager actually manages the owner.
+
+      - from: SUBMITTED
+        to: REJECTED
+        endpoint: "POST /api/v1/expenses/{id}/reject"
+        allowed_roles: [manager_of_owner, finance, admin]
+        control: vulnerable
+        vulnerability: bfla
+        notes: No role check is performed; any authenticated user can reject.
+
+      - from: APPROVED
+        to: PAID
+        endpoint: "POST /api/v1/payments/{id}/process"
+        allowed_roles: [finance, admin]
+        control: secure
+        notes: Requires finance/admin AND expense.status == APPROVED AND payment.status == PENDING.
+
+      - from: any
+        to: any
+        endpoint: "PUT /api/v1/expenses/{id}"
+        allowed_roles: []   # should not be able to change status via this endpoint at all
+        control: vulnerable
+        vulnerability: workflow_bypass
+        notes: >
+          Accepts a raw `status` field from the owner with no state-machine
+          validation, allowing direct DRAFT -> APPROVED or DRAFT -> PAID jumps.
+
+# -----------------------------------------------------------------------------
+# Endpoint authorization requirements
+# (control: secure -> correctly enforced; control: vulnerable -> intentional bug)
+# -----------------------------------------------------------------------------
+endpoints:
+  - path: /api/v1/auth/login
+    method: POST
+    auth_required: false
+    description: "Obtain a JWT bearer token (OAuth2 password form - username/password)."
+
+  - path: /api/v1/users/me
+    method: GET
+    auth_required: true
+    allowed_roles: [employee, manager, finance, admin]
+    ownership: self
+    control: secure
+
+  - path: /api/v1/users/me
+    method: PATCH
+    auth_required: true
+    allowed_roles: [employee, manager, finance, admin]
+    ownership: self
+    control: vulnerable
+    vulnerability: mass_assignment_privilege_escalation
+    tamperable_fields: [role, is_active]
+    notes: >
+      Accepts `role` and `is_active`; every submitted field is applied with no
+      server-side allowlist. Any user can PATCH their own role to Admin.
+
+  - path: /api/v1/users/{id}
+    method: GET
+    auth_required: true
+    allowed_roles: [self, manager_of_target, admin]
+    control: secure
+
+  - path: /api/v1/projects
+    method: GET
+    auth_required: true
+    allowed_roles: [employee, manager, finance, admin]
+    ownership: department_scoped
+    control: secure
+
+  - path: /api/v1/projects/{id}
+    method: GET
+    auth_required: true
+    allowed_roles: [same_department, project_manager, finance, admin]
+    control: secure
+
+  - path: /api/v1/expenses
+    method: POST
+    auth_required: true
+    allowed_roles: [employee, manager, finance, admin]
+    ownership: creates_as_self
+    control: secure
+    notes: user_id is derived server-side from the JWT; not client-settable.
+
+  - path: /api/v1/expenses
+    method: GET
+    auth_required: true
+    allowed_roles: [employee, manager, finance, admin]
+    control: vulnerable
+    vulnerability: parameter_tampering
+    tamperable_param: user_id
+    notes: >
+      For Employee/Manager roles, a `?user_id=<id>` query parameter is trusted
+      directly instead of being derived from the caller's identity, allowing
+      horizontal access to other users' expense lists.
+
+  - path: /api/v1/expenses/{id}
+    method: GET
+    auth_required: true
+    allowed_roles: [owner, finance, admin]
+    control: vulnerable
+    vulnerability: bola
+    notes: No ownership/role check; any authenticated user can read any expense by ID.
+
+  - path: /api/v1/expenses/{id}
+    method: PUT
+    auth_required: true
+    allowed_roles: [owner, admin]
+    ownership: owner
+    control: vulnerable
+    vulnerability: workflow_bypass
+    tamperable_param: status
+    notes: Ownership IS enforced; `status` is not, enabling self-approval / self-payment.
+
+  - path: /api/v1/expenses/{id}/submit
+    method: POST
+    auth_required: true
+    allowed_roles: [owner]
+    control: secure
+
+  - path: /api/v1/expenses/{id}/approve
+    method: POST
+    auth_required: true
+    allowed_roles: [manager_of_owner, admin]
+    control: secure
+
+  - path: /api/v1/expenses/{id}/reject
+    method: POST
+    auth_required: true
+    allowed_roles: [manager_of_owner, finance, admin]
+    control: vulnerable
+    vulnerability: bfla
+    notes: No role check present; any authenticated user, including Employee, can reject.
+
+  - path: /api/v1/payments/{id}
+    method: GET
+    auth_required: true
+    allowed_roles: [finance, admin]
+    control: vulnerable
+    vulnerability: payment_bola
+    notes: No role/ownership check; any authenticated user can view any payment, including account_reference.
+
+  - path: /api/v1/payments/{id}/process
+    method: POST
+    auth_required: true
+    allowed_roles: [finance, admin]
+    control: secure
+    notes: Requires finance/admin role AND expense.status == APPROVED AND payment.status == PENDING.
+
+  - path: /api/v1/admin/users
+    method: GET
+    auth_required: true
+    allowed_roles: [admin]
+    control: secure
+
+  - path: /api/v1/admin/users/{id}/role
+    method: PATCH
+    auth_required: true
+    allowed_roles: [admin]
+    control: secure
+
+  - path: /api/v1/admin/settings
+    method: GET
+    auth_required: true
+    allowed_roles: [admin]
+    control: vulnerable
+    vulnerability: admin_authorization_bypass
+    notes: >
+      Implemented as a denylist ("block Employee") rather than an allowlist
+      ("require Admin"), so Manager and Finance can also read settings meant
+      to be Admin-only. Employees are still correctly blocked (partial fix).
+
+  - path: /api/v1/admin/settings/{key}
+    method: PUT
+    auth_required: true
+    allowed_roles: [admin]
+    control: vulnerable
+    vulnerability: admin_authorization_bypass
+
+# -----------------------------------------------------------------------------
+# Flat vulnerability summary for quick APIAT scenario generation
+# -----------------------------------------------------------------------------
+vulnerability_summary:
+  - id: VULN-1
+    category: BOLA
+    method: GET
+    endpoint: /api/v1/expenses/{id}
+    reproduce: >
+      Login as alice, GET /api/v1/expenses/4 (owned by carol) -> 200 instead of 403.
+
+  - id: VULN-2
+    category: BFLA
+    method: POST
+    endpoint: /api/v1/expenses/{id}/reject
+    reproduce: >
+      Login as alice (Employee), POST /api/v1/expenses/4/reject -> 200 instead of 403.
+
+  - id: VULN-3
+    category: Mass Assignment / Privilege Escalation
+    method: PATCH
+    endpoint: /api/v1/users/me
+    reproduce: >
+      Login as alice, PATCH /api/v1/users/me {"role": "Admin"} -> role becomes Admin.
+
+  - id: VULN-4
+    category: Payment BOLA
+    method: GET
+    endpoint: /api/v1/payments/{id}
+    reproduce: >
+      Login as alice, GET /api/v1/payments/2 (frank's payment) -> 200 instead of 403.
+
+  - id: VULN-5
+    category: Workflow Bypass
+    method: PUT
+    endpoint: /api/v1/expenses/{id}
+    reproduce: >
+      Login as alice, create a DRAFT expense, PUT it with {"status": "PAID"}
+      -> succeeds without going through submit/approve/process.
+
+  - id: VULN-6
+    category: Administrative Authorization Bypass
+    method: GET / PUT
+    endpoint: /api/v1/admin/settings[/{key}]
+    reproduce: >
+      Login as bob (Manager) or david (Finance), GET /api/v1/admin/settings
+      -> 200 instead of 403.
+
+  - id: VULN-7
+    category: Parameter Tampering
+    method: GET
+    endpoint: "/api/v1/expenses?user_id={id}"
+    reproduce: >
+      Login as alice, GET /api/v1/expenses?user_id=6 (carol) -> returns
+      carol's expenses instead of being ignored/blocked.

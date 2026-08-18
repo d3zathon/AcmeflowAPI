@@ -1,0 +1,33 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: acmeflow
+      POSTGRES_PASSWORD: acmeflow
+      POSTGRES_DB: acmeflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - acmeflow_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U acmeflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "python -m app.wait_for_db &&
+             python -m app.seed --reset &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+volumes:
+  acmeflow_pgdata:
